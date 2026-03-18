@@ -466,7 +466,16 @@ async def cb_convert(cq: CallbackQuery, state: FSMContext, bot: Bot):
 
     try:
         from render_utils import process_tgs
-        await loop.run_in_executor(None, process_tgs, tgs_path, out_path, s)
+        from concurrent.futures import ProcessPoolExecutor
+        import functools
+
+        # Run in a SEPARATE PROCESS so that rlottie segfaults / crashes
+        # cannot kill the main bot process.
+        with ProcessPoolExecutor(max_workers=1) as pool:
+            await loop.run_in_executor(
+                pool,
+                functools.partial(process_tgs, tgs_path, out_path, s),
+            )
     except Exception as e:
         log.exception("Render error")
         await _edit_menu(
