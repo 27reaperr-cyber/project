@@ -13,8 +13,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
         libgl1 \
         libglib2.0-0 \
-        libcairo2-dev \
-        pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -23,8 +21,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код
+# Копируем код и env
 COPY bot.py .
+COPY .env .
 
 # База данных создаётся при первом запуске в /app/database.db
 # Через volume-mount можно сохранять между перезапусками
