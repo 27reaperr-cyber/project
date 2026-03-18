@@ -1,0 +1,8 @@
+aiogram==3.13.1
+python-dotenv==1.0.1
+Pillow==10.4.0
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+imageio==2.35.1
+imageio-ffmpeg==0.5.1
+lottie-python[cairo]==0.6.11
