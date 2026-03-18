@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import gzip
+import html
 import io
 import json as json_mod
 import logging
@@ -168,9 +169,13 @@ def hex_to_rgb(h: str) -> tuple[int, int, int]:
     return int(h[:2], 16), int(h[2:4], 16), int(h[4:], 16)
 
 
-def rgb_to_hue(r: int, g: int, b: int) -> float:
-    px = np.array([[[r / 255, g / 255, b / 255]]], dtype=np.float32)
-    return float(cv2.cvtColor(px, cv2.COLOR_RGB2HSV)[0, 0, 0]) * 2.0
+def rgb_to_hsv_norm(r: int, g: int, b: int) -> tuple[float, float]:
+    """Возвращает (hue_degrees, saturation_0_1) для заданного RGB."""
+    px  = np.array([[[r / 255, g / 255, b / 255]]], dtype=np.float32)
+    hsv = cv2.cvtColor(px, cv2.COLOR_RGB2HSV)[0, 0]
+    hue = float(hsv[0]) * 2.0        # OpenCV H [0,180] → [0,360]
+    sat = float(hsv[1]) / 255.0      # [0,1]
+    return hue, sat
 
 
 def valid_hex(h: str) -> bool:
@@ -186,19 +191,27 @@ def norm_hex(h: str) -> str:
 # ОБРАБОТКА ИЗОБРАЖЕНИЙ
 # ══════════════════════════════════════════════════════════════════════════════
 
-def recolor(frame: np.ndarray, hue_deg: float) -> np.ndarray:
+def recolor(frame: np.ndarray, hue_deg: float, target_sat: float = 1.0) -> np.ndarray:
     """
     HSV hue-shift: меняет только Hue, плавно взвешенный по Saturation.
-    Сохраняет детализацию на ненасыщенных (белых/чёрных/серых) пикселях.
+    target_sat: насыщенность целевого цвета [0..1].
+      Если цель нейтральная (белый/чёрный/серый) — только яркостная коррекция,
+      без сдвига Hue, чтобы не давать артефактный красный.
     """
     has_a = frame.ndim == 3 and frame.shape[2] == 4
     alpha = frame[:, :, 3:4].copy() if has_a else None
     rgb   = frame[:, :, :3].copy()
 
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
-    tgt = (hue_deg % 360.0) / 2.0                            # OpenCV H ∈ [0,180]
-    w   = hsv[:, :, 1] / 255.0                               # вес по насыщенности
-    hsv[:, :, 0] = tgt * w + hsv[:, :, 0] * (1.0 - w)
+
+    if target_sat > 0.08:          # цветной таргет → полноценный hue-shift
+        tgt = (hue_deg % 360.0) / 2.0
+        w   = hsv[:, :, 1] / 255.0
+        hsv[:, :, 0] = tgt * w + hsv[:, :, 0] * (1.0 - w)
+        # усиливаем насыщенность пропорционально target_sat
+        hsv[:, :, 1] = np.clip(hsv[:, :, 1] * (0.5 + target_sat), 0, 255)
+    # neutral target → оставляем Hue и Sat без изменений (натуральные тона)
+
     hsv = np.clip(hsv, 0, 255).astype(np.uint8)
     out = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
     return np.concatenate([out, alpha], axis=2) if has_a else out
@@ -325,49 +338,46 @@ def frames_to_mp4(frames: list[np.ndarray], fps: float, crf: int = 23) -> bytes:
 
 def tgs_frames(tgs_bytes: bytes, max_frames: int = 150) -> FrameList:
     """
-    Рендерит TGS-анимацию в список RGBA-кадров.
-    Использует правильный API lottie 0.7.x:
-        Animation.load(json_dict)   — парсинг
-        export_png(anim, path, frame=N)  — рендер через Cairo
+    Рендерит TGS-анимацию через rlottie-python (родной движок Telegram).
+    Возвращает список (RGBA ndarray, duration_sec).
     """
     try:
-        from lottie.objects.animation import Animation
-        from lottie.exporters.cairo import export_png
+        from rlottie_python import LottieAnimation
     except ImportError as e:
-        log.warning("TGS: зависимость недоступна — %s", e)
+        log.warning("rlottie-python не установлен: %s", e)
         return []
 
     try:
-        json_data = json_mod.loads(gzip.decompress(tgs_bytes))
-        anim = Animation.load(json_data)
+        with tempfile.TemporaryDirectory() as tmp:
+            tgs_path = os.path.join(tmp, "anim.tgs")
+            with open(tgs_path, "wb") as f:
+                f.write(tgs_bytes)
+
+            anim        = LottieAnimation.from_tgs(tgs_path)
+            fps         = anim.lottie_animation_get_framerate()
+            total       = anim.lottie_animation_get_totalframe()
+            width, height = anim.lottie_animation_get_size()
+
+            if total <= 0:
+                log.warning("TGS: totalframe=0")
+                return []
+
+            step      = max(1, total // max_frames)
+            frame_dur = step / max(fps, 1)
+            result: FrameList = []
+
+            for i in range(0, total, step):
+                try:
+                    pil_img = anim.render_pillow_frame(frame_num=i)
+                    result.append((np.array(pil_img.convert("RGBA")), frame_dur))
+                except Exception as ex:
+                    log.debug("TGS frame %d: %s", i, ex)
+
+            log.info("TGS: %d кадров @ %.1f fps (%dx%d)", len(result), fps, width, height)
+            return result
     except Exception as e:
-        log.error("TGS parse: %s", e)
+        log.error("TGS render error: %s", e, exc_info=True)
         return []
-
-    fps    = float(getattr(anim, "frame_rate", 30) or 30)
-    in_pt  = int(getattr(anim, "in_point",    0))
-    out_pt = int(getattr(anim, "out_point",   0))
-    total  = out_pt - in_pt
-    if total <= 0:
-        log.warning("TGS: пустая анимация (in=%d out=%d)", in_pt, out_pt)
-        return []
-
-    step      = max(1, total // max_frames)
-    frame_dur = step / fps
-    result: FrameList = []
-
-    with tempfile.TemporaryDirectory() as tmp:
-        for fn in range(in_pt, out_pt, step):
-            fp = os.path.join(tmp, f"f{fn:04d}.png")
-            try:
-                export_png(anim, fp, frame=fn)
-                arr = np.array(Image.open(fp).convert("RGBA"))
-                result.append((arr, frame_dur))
-            except Exception as ex:
-                log.debug("TGS frame %d: %s", fn, ex)
-
-    log.info("TGS: %d кадров @ %.1f fps", len(result), fps)
-    return result
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ГЛАВНЫЙ ПАЙПЛАЙН
@@ -425,7 +435,7 @@ async def build_banner(
         except Exception as e:
             log.warning("bg_img load: %s", e)
 
-    target_hue = rgb_to_hue(*hex_to_rgb(ec))
+    target_hue, target_sat = rgb_to_hsv_norm(*hex_to_rgb(ec))
 
     # ── Декодирование кадров ─────────────────────────────────────────────────
     if ext == ".tgs":
@@ -433,8 +443,7 @@ async def build_banner(
         raw_frames: FrameList = await asyncio.to_thread(tgs_frames, raw, limit)
         if not raw_frames:
             raise ValueError(
-                "TGS рендеринг недоступен.\n"
-                "Убедитесь что <code>lottie[cairo]</code> и <code>pycairo</code> установлены."
+                "TGS рендеринг недоступен — проверьте что rlottie-python установлен в образе."
             )
     else:
         def _decode() -> FrameList:
@@ -454,7 +463,7 @@ async def build_banner(
     def _process() -> tuple[list[np.ndarray], list[float]]:
         out_f, out_d = [], []
         for frm, dur in raw_frames:
-            colored = recolor(frm, target_hue)
+            colored = recolor(frm, target_hue, target_sat)
             banner  = compose_frame(colored, bg, cw, ch, note, wm, bg_img)
             out_f.append(banner)
             out_d.append(dur)
@@ -663,7 +672,10 @@ async def _accept(
         db_log(msg.from_user.id, ftype)
     except Exception as e:
         log.error("build_banner: %s", e, exc_info=True)
-        await msg.answer(f"❌ Ошибка: {e}", reply_markup=kb_main())
+        await msg.answer(
+            f"❌ Ошибка: {html.escape(str(e))}",
+            reply_markup=kb_main(),
+        )
     finally:
         try:
             await status.delete()
@@ -1095,7 +1107,7 @@ async def _show_preview(msg: Message, state: FSMContext, bot: Bot) -> None:
         )
     except Exception as e:
         log.error("preview: %s", e, exc_info=True)
-        await msg.answer(f"❌ Ошибка предосмотра: {e}")
+        await msg.answer(f"❌ Ошибка предосмотра: {html.escape(str(e))}")
     finally:
         try:
             await status.delete()
