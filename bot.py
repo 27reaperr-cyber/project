@@ -452,8 +452,9 @@ def _frames_to_mp4(
 
 def _try_import_lottie():
     try:
+        import lottie
         from lottie import parsers as lottie_parsers
-        from lottie.exporters import exporters as lottie_exporters
+        from lottie import exporters as lottie_exporters
         return lottie_parsers, lottie_exporters
     except ImportError:
         return None, None
