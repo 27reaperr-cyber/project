@@ -23,9 +23,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код и env
+# Копируем код
 COPY bot.py .
-COPY .env .
 
 # База данных создаётся при первом запуске в /app/database.db
 # Через volume-mount можно сохранять между перезапусками
